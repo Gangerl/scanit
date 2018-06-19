@@ -1,0 +1,551 @@
+#!/bin/bash
+#
+# scanit: Scan IPs with known ports
+#
+# Telekom Security
+# Wolfgang Laufher
+
+PATH=/bin:/usr/bin:/sbin:/usr/sbin
+export LC_ALL=C; export LANG=en_US.UTF-8
+umask 022
+
+# Check parameters
+if [ $# -ne 2 ]; then
+	echo "$0 needs 2 parameters: <Option> <Projectname>"
+	echo "Options: scanhere, scan, eval, create, clone, delete"
+	echo ""
+	exit 1
+fi
+OPTION=$1
+PROJECT=$2
+
+# MAIN program starts at the end of this file
+
+##############################################################
+
+_check_if_exist_and_then_include_conf_else_exit() {
+	if [ ! -s $PROJECT.conf ]; then
+		echo "Missing or empty Config-File $PROJECT.conf. Aborting."
+		exit 1
+	fi
+	. $PROJECT.conf
+}
+
+
+_initialize_vars_dirs_files() {
+	MYPID=$$
+	DATE=$(date +%Y-%m-%d)
+	DATETIME=$(date --iso-8601=seconds)
+	# Dirs and Files
+	SCANITDIR=$(dirname $0)
+	#SCANITDIR=$HOME
+	ASSETFILE=$SCANITDIR/$PROJECT.assetdb
+	LOGFILE=$SCANITDIR/$PROJECT.log
+	OUTDIR=$SCANITDIR/out/$PROJECT
+	DATADIR=$SCANITDIR/data/$PROJECT
+	SCANRESULT=$DATADIR/$PROJECT.result.$HOSTNAME
+	SCANRESULT_ARCHIVE=$SCANRESULT.$DATETIME
+	DELETEDPROJECTDIR=$SCANITDIR/deleted/$PROJECT
+
+	# where to copy all data to = Central Site "CS"
+	CS=two.epic.ovh
+	CSUSER=scanit
+	CSPORT=8443
+	CSSFTPKEY="$SCANITDIR/.ssh/id_ed25519"
+
+	### FOR SCANNER ###
+	# Assumes installed packages nmap, zmap (>2.1), stuntman-client
+	# Assumes tftptheft/finder.py as git clone in ~
+	# Customize nmap: setcap cap_net_raw,cap_net_admin,cap_net_bind_service+ep /usr/bin/nmap
+	# Customize zmap: setcap cap_net_raw,cap_net_admin,cap_net_bind_service+ep /usr/sbin/zmap
+	# Beware of zmap config in /etc/zmap/zmap.conf
+	NMAP="/usr/bin/nmap --max-rate=95 --privileged"
+	ZMAP="/usr/sbin/zmap --quiet --verbosity=2 --rate=95 --cooldown-time=2"	# Default max 100 pps
+	ZFORMAT="saddr,sport,classification"
+	ZUDPPROBES="/usr/share/doc/zmap/examples/udp-probes"
+	ZFILTER="grep -v \"icmp-unreach\""
+	# stunclient also available via git if needed
+	STUNCLIENT=/usr/bin/stunclient
+	# git clone https://github.com/EnableSecurity/tftptheft.git
+	TFTPFINDER=$SCANITDIR/tftptheft/finder.py
+
+	### FOR EVALUATER ###
+	# git clone https://github.com/Gangerl/csv2html.git
+	CSV2HTML=$SCANITDIR/csv2html/csv2html
+	# git clone https://github.com/EugenDueck/diff2html.git
+	DIFF2HTML=$SCANITDIR/diff2html/diff2html
+}
+
+##########################################################
+# Common things
+
+_log() {
+    echo "[$(date --iso-8601=seconds)] $*" >> $LOGFILE
+}
+
+#
+##########################################################
+# Scanners
+
+###############################
+# Output formats:
+# TCP:  ip,port,tcpanswer[synack|rst]
+# UDP:  ip,port,"udp",application[dns|ntp|stun|tftp]"
+# ICMP: ip,icmptype[echoreply|ping]
+###############################
+
+# TCP syn scan, classification is "synack" or "rst"
+_do_tcp_scan() {
+	TYPE=$1
+	for PORT in $TCP_PORTS; do
+		_log "Scanning TCP Port $PORT"
+		$ZMAP -M tcp_synscan -p $PORT -O csv -o - -f $ZFORMAT $2 \
+		| $ZFILTER | tail -n +2 | sort -t ","  | tee $DATADIR/tcp_$PORT >> $SCANRESULT
+	done
+}
+
+# ICMP echo time scan
+_do_zmap_icmp_echo_time_scan() {
+	_log "Scanning ICMP echo_time with zmap"
+	$ZMAP -M icmp_echo_time --probes=2 -O csv -o - -f "saddr,classification" $2 \
+	| $ZFILTER | tail -n +2 | sort -t ","  | tee $DATADIR/icmp_echo_time >> $SCANRESULT
+}
+
+# ICMP echo scan
+_do_zmap_icmp_scan() {
+	_log "Scanning ICMP echo with zmap"
+	$ZMAP -M icmp_echoscan --probes=2 -O csv -o - -f "saddr,classification" $2 \
+	| $ZFILTER | tail -n +2 | sort -t ","  | tee $DATADIR/icmp_echo >> $SCANRESULT
+}
+
+# Another ICMP Ping scan, with nmap (more reliable?!?)
+_do_nmap_ping_scan() {
+	TYPE=$1
+	_log "Scanning ICMP Ping with nmap"
+	# -n: no DNS reverse Lookup
+	# -T3: Default, T4: aggressiv = schnell
+	# --max-rtt-timeout  bringt die Geschwindigkeit!
+	# -oG -: Output-Format "grep" > STDOUT, also ASCII tabellarisch
+	$NMAP -n -sP -PE -T3 --max_rtt_timeout 80ms --max-retries 1 -oG - $2 2>/dev/null \
+	| grep -v "#" | egrep -v "() *Status: Down" | cut -d " " -f 2 | sed "s/$/,$TYPE/" \
+	| sort -t "," | tee $DATADIR/ping >> $SCANRESULT
+}
+
+# NTP scan
+_do_ntp_scan() {
+	PORT=$1
+	_log "Scanning UDP PORT $PORT for NTP"
+	$ZMAP -M udp -p $PORT --probe-args=file:$ZUDPPROBES/ntp_123.pkt -O csv -o - -f $ZFORMAT $2 \
+	| $ZFILTER | tail -n +2 | sed "s/$/,ntp/" | sort -t ","  | tee $DATADIR/udp_$PORT >> $SCANRESULT
+}
+
+# DNS simple scan
+_do_dns_scan() {
+	PORT=$1
+	_log "Scanning UDP PORT $PORT for DNS"
+	$ZMAP -M udp -p $PORT  --probe-args=file:$ZUDPPROBES/dns_53.pkt -O csv -o - -f $ZFORMAT $2 \
+	| $ZFILTER | tail -n +2 | sed "s/$/,dns/" | sort -t ","  | tee $DATADIR/udp_$PORT >> $SCANRESULT
+}
+
+# TFTP with helper prog needs tftptheft from github
+_do_tftp_scan() {
+	PORT=$1
+	_log "Scanning UDP PORT $PORT for TFTP"
+	$TFTPFINDER -f Scanit.file $2 2>&1 | grep "IP:" | cut -d ":" -f 4 \
+	| sed "s/ //g" | sed "s/$/,$PORT,udp,tftp/" | sort -t "," | tee $DATADIR/udp_$PORT >> $SCANRESULT
+}
+
+# STUN with helper prog needs package stuntman-client
+_do_stun_scan() {
+	PORT=$1
+	_log "Scanning UDP Port $PORT for STUN"
+	FOURTH_IP=$(seq $3 $4)
+	for i in $FOURTH_IP; do
+		IP="$2.$i"
+		$STUNCLIENT $IP $PORT | grep -q success && echo "$IP,$PORT,udp,stun"; done \
+	| sort -t "," | tee $DATADIR/udp_$PORT >> $SCANRESULT
+}
+
+# Scanners end
+
+
+# sFTP to central site CS
+_do_sftp() {
+	command=$1
+	_log "Sftp to $CS, command = $command"
+	echo "$command" | sftp -P $CSPORT -oStrictHostKeyChecking=no -i $CSSFTPKEY $CSUSER@$CS
+	if [ $? == 0 ]; then 
+		_log "Sftp successful"
+	else
+		_log "Sftp error"
+	fi
+}
+
+##########################################################
+# Evaluation helpers
+
+_calculate_headers() {
+	HEADER_TCP_PORTS=$(echo $TCP_PORTS | sed "s/ /;/g")
+	HEADER_UDP_PORTS=$(echo $UDP_PORTS | sed "s/ /;U/g" | sed "s/^/U/")
+	COUNT_TCP_PORTS=$(echo $TCP_PORTS | awk '{print NF}')
+	COUNT_UDP_PORTS=$(echo $UDP_PORTS | awk '{print NF}')
+	# for CSV2HTML: outputfield 6 = ICMP; calculate UDP + TCP fields
+	USTART=7
+	UEND=$(($USTART-1+$COUNT_UDP_PORTS))
+	TSTART=$(($UEND+1))
+	TEND=$(($TSTART-1+$COUNT_TCP_PORTS))
+	UXCOLS=$(seq -s "," $USTART $UEND)
+	TXCOLS=$(seq -s "," $TSTART $TEND)
+	RST=$(($TEND+1))
+}
+
+_archive_incoming() {
+	cd $DATADIR/incoming
+	for file in $(ls $PROJECT.result.*); do
+		cp --archive $file $DATADIR/archive/$file.$DATETIME
+	done
+}
+
+_archive_result_and_diff() {
+	# Create file for a diff vs. old version without ping/icmp-echo information because it's unreliable 
+	sed "s/echo//" $OUTDIR/$PROJECT.csv > $OUTDIR/$PROJECT.csv.fordiff
+
+	# Generate a diff against a version that is at most 1 day old (900minutes)
+	oldfile=$(find $OUTDIR/archive -name "*.csv.fordiff" -mmin +900 | xargs ls -rt | tail -1)
+	if [ -n "$oldfile" ]; then
+		diff $OUTDIR/$PROJECT.csv.fordiff $oldfile > $OUTDIR/$PROJECT.diff
+		# create a html version
+		$DIFF2HTML $OUTDIR/$PROJECT.csv.fordiff $oldfile > $OUTDIR/$PROJECT.diff.html
+		cp $OUTDIR/$PROJECT.diff        $OUTDIR/archive/$PROJECT-$DATETIME.diff
+		cp $OUTDIR/$PROJECT.diff.html   $OUTDIR/archive/$PROJECT-$DATETIME.diff.html
+	fi
+
+	# Make copies for the archive
+	cp $OUTDIR/$PROJECT.html        $OUTDIR/archive/$PROJECT-$DATETIME.html
+	cp $OUTDIR/$PROJECT.csv         $OUTDIR/archive/$PROJECT-$DATETIME.csv
+	cp $OUTDIR/$PROJECT.csv.fordiff $OUTDIR/archive/$PROJECT-$DATETIME.csv.fordiff
+}
+
+_check_if_assetdb_exists_else_exit() {
+	if [ ! -f "$ASSETFILE" ]; then 
+		echo "No assetdb $ASSETFILE found. Exiting"
+		exit 1
+	fi
+}
+
+_if_local_conf_exists_then_overwrite_vars_dirs_files
+	# local customizing e.g. for binaries, like another zmap location
+	test -s local.conf && . local.conf
+}
+
+_do_scan() {
+	> $SCANRESULT
+	DST_ALL=$(echo ${IPS_ALL})
+	DST_TCP=$(echo ${IPS_TCP})
+	DST_UDP=$(echo ${IPS_UDP})
+	# ICMP
+	_log "Scanning ICMP $DST_ALL"
+	_do_zmap_icmp_scan icmp "$DST_ALL"
+	_do_nmap_ping_scan ping "$DST_ALL"
+	_do_zmap_icmp_echo_time_scan icmp "$DST_ALL"
+	# TCP
+	_log "Scanning TCP $DST_TCP"
+	_do_tcp_scan tcp "$DST_TCP"
+	# UDP
+	_log "Scanning UDP $DST_UDP"
+	for port in $UDP_DNS; do
+		_do_dns_scan $port "$DST_UDP"
+	done
+
+	for port in $UDP_TFTP; do
+		_do_tftp_scan $port "$DST_UDP"
+	done
+
+	for port in $UDP_NTP; do
+		_do_ntp_scan $port "$DST_UDP"
+	done
+
+	for port in $UDP_STUN; do
+		_do_stun_scan $port $UDP_STUN_CLASSC $UDP_STUN_START $UDP_STUN_END
+	done
+
+	mv $SCANRESULT $SCANRESULT_ARCHIVE
+	cat $SCANRESULT_ARCHIVE | grep -v -e "^1.1.1.1" -e "^9.9.9.9" -e "^192.168.2" > $SCANRESULT
+}
+
+
+_do_eval() {
+	_calculate_headers
+
+	###############################
+	# Input formats:
+	# TCP:  ip,port,tcpanswer[synack|rst]
+	# UDP:  ip,port,"udp",application[dns|ntp|stun|tftp]"
+	# ICMP: ip,icmptype[echoreply|ping]
+	###############################
+
+cat $DATADIR/incoming/$PROJECT.result.* \
+| nawk -F "," -v OFS=";" '
+BEGIN {
+	tportlist = "'$HEADER_TCP_PORTS'"
+	nr_tports = split (tportlist, tports, ";")
+	uportlist = "'$HEADER_UDP_PORTS'"
+	gsub(/U/,"",uportlist)
+	nr_uports = split (uportlist, uports, ";")
+	# reading ASSETFILE
+	while ( getline assetline < "'$ASSETFILE'" ) {
+		if (assetline ~ /^#/) continue
+		if (assetline !~ /^([0-9]{1,3}\.){3}[0-9]{1,3},/) {
+			print "Error in AssetDB: " assetline > "/dev/stderr"
+			continue
+		}
+		split(assetline, asset, ",")
+		ip=asset[1]
+		name[ip]=asset[2]; role[ip]=asset[3]; site[ip]=asset[4]
+		delete asset
+	}
+	close("'$ASSETFILE'")
+}
+# Start Parsing input
+# 1st: Validation: all lines have to start with an IPv4 address
+! /^([0-9]{1,3}\.){3}[0-9]{1,3},/ {
+	print "Error on Input Validation: " $0 > "/dev/stderr"
+	next
+}
+{	# All lines
+	ip = $1
+	port = $2
+	active[ip] = 1
+	if (! (ip in name) ) name[ip] = "?"
+}
+# ICMP
+$2=="echoreply" || $2=="ping" {
+	icmpechoreply[ip] = "echo"
+	next
+}
+#TCP
+$3=="synack" {
+	tcpopen[ip, port] = port
+	next
+}
+$3=="rst" {
+	tcprst[ip] = tcprst[ip] "," port
+	next
+}
+# UDP
+$3=="udp" {
+	if ($4) udp[ip, port] = toupper($4)
+	else udp[ip, port] = "U" port
+	next
+}
+# All other: Huups - unknown line
+{
+	print "Unknown line in input: " $0 > "/dev/stderr"
+}
+# End of input - doing the output
+END {
+	for (ip in name) {
+		printf ip 					# Field  1
+		printf ";" name[ip] ";" role[ip] ";" site[ip]	# Fields 2,3,4
+		printf ";" active[ip] ";" icmpechoreply[ip] 	# Fields 5,6
+		for (i=1;i<=nr_uports;i++) {
+			printf ";"
+			port = uports[i]
+			if (udp[ip, port]) printf udp[ip, port]
+		}
+		for (i=1; i<=nr_tports; i++) {
+			printf ";"
+			port = tports[i]
+			if (tcpopen[ip, port]) printf port
+		}
+		sub(/,/,"",tcprst[ip])
+		printf ";" tcprst[ip]
+		printf "\n"
+	}
+}
+' | sort -V | tee $OUTDIR/$PROJECT.csv | (
+echo "TITLER;Scanit results for project $PROJECT"
+echo "FORMAT;l;c;c;c;cn;;;"
+echo "HEADER;IP;Name;Role;Site;On;ICMP;$HEADER_UDP_PORTS;$HEADER_TCP_PORTS;RST"
+echo "BEFORE;Scanned IP-Ranges: $(echo $IPS_ALL)"
+echo "BEFORE;<br />Scanned TCP Ports: $(echo $TCP_PORTS)"
+echo "BEFORE;<br />Scanned UDP Ports: $(echo $UDP_PORTS)"
+cat -
+) | $CSV2HTML -H -C -n -t 5 -y "T-Sec" --info-titles -x 3,4,6,$UXCOLS,$TXCOLS,$RST \
+  > $OUTDIR/$PROJECT.html
+
+
+}
+
+_sanitize_conf() {
+	# Mind the ""!
+	IPS_ALL=$(echo "$IPS_ALL" | sed "s/#.*$//")
+	IPS_TCP=$(echo "$IPS_TCP" | sed "s/#.*$//")
+	IPS_UDP=$(echo "$IPS_UDP" | sed "s/#.*$//")
+	TCP_PORTS=$(echo "$TCP_PORTS" | sed "s/#.*$//")
+	UDP_PORTS=$(echo "$UDP_PORTS" | sed "s/#.*$//")
+}
+
+_check_whether_there_is_already_a_conf_then_exit() {
+if [ -e $PROJECT.conf ]; then
+	echo "$PROJECT.conf already exists. Aborting."
+	exit 1
+fi
+}
+
+
+_do_create_conf() {
+cat > $PROJECT.conf << EndOfMessage
+# Scanit conf file
+
+# IPs to scan, primarly with ICMP
+IPS_ALL="
+127.0.0.1/32 # localhost? perhaps
+# uncoment what you need
+#192.168.178.0/24
+10.2.3.0/25
+"
+
+# For TCP scan, this may be less or the same. Mind the "" !
+IPS_TCP="\$IPS_ALL"
+
+# For UDP scan, this may be less or the same
+IPS_UDP="\$IPS_ALL"
+
+# TCP ports, typical examples
+TCP_PORTS="
+21	# FTP
+22	# SSH
+23	# Telnet
+25	# SMTP
+49	# TACACS
+80	# HTTP
+110	# POP3
+111	# RPC
+139	# Netbios
+143	# IMAP
+179	# BGP
+389	# LDAP
+443	# HTTPS
+445	# Microsoft-DS
+465	# SMTPS
+587	# SMTPTLS
+636	# LDAPS
+993	# IMAPS
+995	# POP3S
+1433	# MSSQL
+1521	# Oracle
+3128	# HTTP Proxy
+3306 	# MySQL
+3389	# RDP
+5222	# XMPP
+5432	# PostgreSQL
+8000	# Another Web
+8080	# Web Proxy
+"
+
+# UDP Ports examples to scan # not so simple, you need the right request, see below
+UDP_PORTS="
+53
+123
+5353
+"
+
+# we have to know the type of UDP scan
+UDP_DNS="53 5353"
+UDP_NTP="123"
+UDP_TFTP=""
+UDP_STUN=""
+# only 1 Class C maximal, and write down here the first thre octets
+UDP_STUN_CLASSC="192.168.1"
+# and definde the start and end of fourth octect
+UDP_STUN_START=145
+USP_STUN_END=244
+
+# End of Scanit conf
+EndOfMessage
+}
+
+
+################################
+############# MAIN #############
+################################
+
+# PROJECT & OPTION are initialized at the beginning of this file
+_initialize_vars_dirs_files 	# needs PROJECT
+_if_local_conf_exists_then_overwrite_vars_dirs_files
+
+case "$OPTION" in
+	scanhere)
+		echo "Will scan Project $PROJECT and saves data local."
+		_check_if_exist_and_then_include_conf_else_exit
+		_sanitize_conf
+		_log ">>>--- Scanit Scanner $0 PID $MYPID started #####"
+		_do_scan
+		mkdir -p $DATADIR/incoming
+		mkdir -p $DATADIR/archive
+		cp $SCANRESULT $DATADIR/incoming
+		_log "---<<< Scanit Scanner $0 PID $MYPID ended #####"
+		echo "Done. Results are in $DATADIR and transferred to $DATADIR/incoming."
+	;;
+	scan)
+		echo "Will scan Project $PROJECT and sent data to $CS."
+		_check_if_exist_and_then_include_conf_else_exit
+		_sanitize_conf
+		_log ">>>--- Scanit Scanner $0 PID $MYPID started #####"
+		_do_scan
+		_do_sftp "put $SCANRESULT $DATADIR/incoming"
+		_log "---<<< Scanit Scanner $0 PID $MYPID ended #####"
+		echo "Done. Results are in $DATADIR."
+	;;
+	eval)
+		echo "Making pretty HTML and CSV output for Project $PROJECT."
+		_check_if_exist_and_then_include_conf_else_exit
+		_sanitize_conf
+		_check_if_assetdb_exists_else_exit
+		mkdir -p $OUTDIR/archive
+		_archive_incoming
+		_log ">>>--- Eval $PROJECT started"
+		_do_eval
+		_log "---<<< Eval $PROJECT ended"
+		_archive_result_and_diff
+		echo "Done. Look in $OUTDIR."
+	;;
+	create)
+		echo "Creating new Project $PROJECT."
+		_check_whether_there_is_already_a_conf_then_exit
+		_do_create_conf
+		touch $ASSETFILE
+		mkdir -p $DATADIR
+		mkdir -p $DATADIR/incoming
+		mkdir -p $DATADIR/archive
+		echo "Done. Please adjust variables in $PROJECT.conf"
+	;;
+	clone)
+		echo "Getting config for Project $PROJECT from Server $CS."
+		_do_sftp "get $PROJECT.conf"
+		mkdir -p $DATADIR
+		echo "Done."
+	;;
+	delete)
+		echo "Do you really want to delete all files (except output html and csv) of project $PROJECT (y/n)?"
+		read answer
+		if [ "$answer" = "y" ]; then echo "Continuing"; else echo "Abort."; exit 1; fi
+
+		mkdir -p $DELETEDPROJECTDIR
+		mkdir -p $DELETEDPROJECTDIR/data
+		mkdir -p $DELETEDPROJECTDIR/out
+		mv $DATADIR $DELETEDPROJECTDIR/data
+		mv $OUTDIR $DELETEDPROJECTDIR/out
+		mv $ASSETFILE $DELETEDPROJECTDIR
+		mv $PROJECT.log $DELETEDPROJECTDIR
+		mv $PROJECT.conf $DELETEDPROJECTDIR
+		echo "Project $PROJECT deleted (moved to \"deletedprojects\" :-)"
+	;;
+	*) echo "Wrong Option. Aborting."
+	   exit 1
+	;;
+esac
+
+# FIN.
+# vim:syntax=awk
