@@ -1,15 +1,19 @@
 # scanit
 A customizable distributed IPv4/TCP/UDP scanner for discovering services
 
-Needs at least:
-zmap installed, with privileges (set by setcap, see in the file)
+_Needs at least:_
+- csv2html: git clone https://github.com/Gangerl/csv2html.git
+- diff2html: git clone https://github.com/EugenDueck/diff2html.git
+
+these should be installed in parallel to the scanit-Directory, i.e. where you did the git clone Gangerl/scanit.git
+- zmap installed, with privileges (set by setcap, see in the file)
 For more scanners see file :-)
 
-Usage: 
+_Usage:_
 scanit needs 2 parameters: <Option> <Projectname>
 Options: scanhere, scan, eval, create, clone, delete
 
-Example:
+_Example:_
 1.) Create a new project, e.g. "myhomenet":
 scanit create myhomenet
 
